@@ -12,7 +12,6 @@ import sys
 import requests
 import subprocess
 import tempfile
-from itertools import product
 from typing import Iterator, List, Optional
 
 RESOLVERS_URL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
@@ -46,9 +45,6 @@ def pattern_domain_generator(
     """
     Yields domains for a single pattern.
     Optimized to stream the main (large) wordlist line-by-line so we don't load it into memory.
-    Assumptions:
-      - number_words & region_words are small (stored in memory)
-      - main_wordlist_path may be huge -> stream
     Supports placeholders: {fuzz_all}, {fuzz}, {fuzz_number} -> main list
                         {number} -> number_words
                         {region} -> region_words
@@ -56,6 +52,10 @@ def pattern_domain_generator(
     needs_main = any(x in pattern for x in ("{fuzz_all}", "{fuzz}", "{fuzz_number}"))
     needs_number = "{number}" in pattern
     needs_region = "{region}" in pattern
+
+    # If main is required but missing, generator yields nothing (caller will see 0)
+    if needs_main and not os.path.exists(main_wordlist_path):
+        return
 
     # Cases where main is not required
     if not needs_main:
@@ -71,16 +71,10 @@ def pattern_domain_generator(
             for r in region_words:
                 yield pattern.replace("{region}", r)
         else:
-            # No recognized placeholders -> skip by not yielding
+            # No recognized placeholders -> nothing to generate
             return
-
     else:
-        # main is required; stream main file:
-        if not os.path.exists(main_wordlist_path):
-            # nothing to yield
-            return
-
-        # choose which fuzz placeholder(s) exist (order matters for replacement)
+        # stream main file:
         main_placeholders = []
         if "{fuzz_all}" in pattern:
             main_placeholders.append("{fuzz_all}")
@@ -89,10 +83,8 @@ def pattern_domain_generator(
         if "{fuzz_number}" in pattern:
             main_placeholders.append("{fuzz_number}")
 
-        # If main + number + region: we iterate main outer, then small lists inner (so main streamed once)
         with open(main_wordlist_path, "r", encoding="utf-8", errors="ignore") as mf:
             for main_word in (w.strip() for w in mf if w.strip()):
-                # build base replaced with main placeholder(s)
                 base = pattern
                 for ph in main_placeholders:
                     base = base.replace(ph, main_word)
@@ -126,7 +118,6 @@ def run_massdns_on_targets(resolvers_file: str, targets_list: List[str], tmp_res
     cmd = ["massdns", "-r", resolvers_file, "-t", "A", "-o", "S", "-w", tmp_results_path, tmp_targets_path]
     try:
         subprocess.run(cmd, check=True)
-        # remove tmp targets file
         try:
             os.remove(tmp_targets_path)
         except OSError:
@@ -140,9 +131,6 @@ def run_massdns_on_targets(resolvers_file: str, targets_list: List[str], tmp_res
 def parse_massdns_results_for_alive(results_path: str) -> List[str]:
     """
     Parse massdns S-format output and return unique domains that have A records in this file.
-    massdns S format lines typically look like:
-      example.com. A 1.2.3.4
-    We'll extract the left-most token (domain) and strip trailing dot.
     """
     alive = []
     if not os.path.exists(results_path):
@@ -152,12 +140,21 @@ def parse_massdns_results_for_alive(results_path: str) -> List[str]:
             line = line.strip()
             if not line:
                 continue
-            # ignore NXDOMAIN or RCODE lines; massdns S-format shows only successes and RRs, but be defensive
             parts = line.split()
             if len(parts) >= 3 and parts[1].upper() == "A":
                 name = parts[0].rstrip(".")
                 alive.append(name)
     return alive
+
+def append_alive(alive_list: List[str], seen_alive: set):
+    if not alive_list:
+        return
+    with open(ALIVE_FILE, "a", encoding="utf-8") as af:
+        for d in alive_list:
+            if d not in seen_alive:
+                af.write(d + "\n")
+                seen_alive.add(d)
+    print(f"[+] Found {len(alive_list)} alive (this batch). Total unique alive so far: {len(seen_alive)}")
 
 def process_patterns_stream(
     patterns_file: str,
@@ -171,7 +168,7 @@ def process_patterns_stream(
     number_words = read_small_list(number_file)
     region_words = read_small_list(region_file)
 
-    # Ensure alive file exists
+    # Ensure alive file and seen set
     seen_alive = set()
     if os.path.exists(ALIVE_FILE):
         with open(ALIVE_FILE, "r", encoding="utf-8") as af:
@@ -181,8 +178,16 @@ def process_patterns_stream(
     with open(patterns_file, "r", encoding="utf-8") as pf:
         patterns = [p.strip() for p in pf if p.strip()]
 
+    main_exists = os.path.exists(main_wordlist)
+
     for pattern in patterns:
         print(f"[+] Processing pattern: {pattern}")
+
+        # Quick check: if pattern needs main but main doesn't exist -> skip that pattern
+        if any(x in pattern for x in ("{fuzz_all}", "{fuzz}", "{fuzz_number}")) and not main_exists:
+            print(f"[!] Skipping pattern because main wordlist is missing: {pattern}")
+            continue
+
         gen = pattern_domain_generator(pattern, main_wordlist, number_words, region_words)
 
         batch = []
@@ -192,9 +197,8 @@ def process_patterns_stream(
             batch.append(domain)
             processed_for_pattern += 1
 
-            # If cap reached for pattern, stop generating more domains for this pattern
+            # If cap reached for pattern, process current batch then stop generating more for this pattern
             if max_per_pattern and processed_for_pattern >= max_per_pattern:
-                # process the current batch then break outer loop
                 if batch:
                     batch_count += 1
                     tmp_results = os.path.join(OUTPUT_DIR, f"massdns_{os.getpid()}_{batch_count}.txt")
@@ -237,20 +241,10 @@ def process_patterns_stream(
 
         print(f"[+] Finished pattern: {pattern} (tested {processed_for_pattern} names)")
 
-def append_alive(alive_list: List[str], seen_alive: set):
-    if not alive_list:
-        return
-    with open(ALIVE_FILE, "a", encoding="utf-8") as af:
-        for d in alive_list:
-            if d not in seen_alive:
-                af.write(d + "\n")
-                seen_alive.add(d)
-    print(f"[+] Found {len(alive_list)} alive (this batch). Total unique alive so far: {len(seen_alive)}")
-
 def main():
     parser = argparse.ArgumentParser(description="Streamed DNS fuzzing runner (pattern-by-pattern, batch checks)")
     parser.add_argument("patterns", help="File containing domain patterns (e.g., output of your fuzz generator)")
-    parser.add_argument("wordlist", nargs="?", default="2m-subdomains.txt", help="Main wordlist for generic FUZZ placeholders (default: 2m-subdomains.txt)")
+    parser.add_argument("wordlist", nargs="?", default="./wordlists/2m-subdomains.txt", help="Main wordlist for generic FUZZ placeholders (default: ./wordlists/2m-subdomains.txt)")
     parser.add_argument("--number-file", default="number.txt", help="Wordlist for {number} placeholder (default: number.txt)")
     parser.add_argument("--region-file", default="region.txt", help="Wordlist for {region} placeholder (default: region.txt)")
     parser.add_argument("--batch-size", type=int, default=1000, help="Number of names to resolve per massdns run (default: 1000)")
@@ -262,7 +256,6 @@ def main():
         print(f"[-] Missing patterns file: {args.patterns}")
         sys.exit(1)
 
-    # If main wordlist is missing, we will still process patterns that don't require main.
     if not os.path.exists(args.wordlist):
         print(f"[!] Warning: main wordlist '{args.wordlist}' not found. Patterns requiring main placeholders will be skipped.")
 
@@ -276,8 +269,6 @@ def main():
     # If user didn't ask to run DNS, perform a dry run (print what would happen)
     if not args.run_dns:
         print("[i] Dry-run mode (no massdns). To actually resolve, add --run-dns")
-        # For dry-run we still walk patterns but won't call massdns; we'll only show counts for the first few items.
-        # Reuse process_patterns_stream but temporarily monkeypatch run_massdns_on_targets to skip calls.
         original_run = globals()['run_massdns_on_targets']
         globals()['run_massdns_on_targets'] = lambda *a, **k: True
         process_patterns_stream(
