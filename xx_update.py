@@ -15,7 +15,7 @@ from typing import Iterator, List, Optional
 
 RESOLVERS_URL = "https://raw.githubusercontent.com/trickest/resolvers/refs/heads/main/resolvers.txt"
 OUTPUT_DIR = "dns_fuzz_results"
-ALIVE_FILE = os.path.join(OUTPUT_DIR, "alive.txt")
+ALIVE_FILE = os.path.join(OUTPUT_DIR, "output.txt")  # user asked for output.txt
 DEFAULT_MAIN_WORDLIST = "./wordlists/2m-subdomains.txt"
 
 def download_resolvers(output_path: str):
@@ -80,6 +80,7 @@ def pattern_domain_generator(
         if "{fuzz_number}" in pattern:
             main_placeholders.append("{fuzz_number}")
 
+        # Stream the large file to avoid memory blowout
         with open(main_wordlist_path, "r", encoding="utf-8", errors="ignore") as mf:
             for main_word in (w.strip() for w in mf if w.strip()):
                 base = pattern
@@ -99,7 +100,15 @@ def pattern_domain_generator(
                 else:
                     yield base
 
-def run_massdns_on_targets(resolvers_file: str, targets_list: List[str], tmp_results_path: str, threads: int) -> bool:
+def run_massdns_on_targets(
+    massdns_bin: str,
+    resolvers_file: str,
+    targets_list: List[str],
+    tmp_results_path: str,
+    processes: int,
+    socket_count: int,
+    hashmap_size: int,
+) -> bool:
     """
     Run massdns against the provided list of targets (written to a temp file).
     Returns True on success (massdns exit 0) or False otherwise.
@@ -111,8 +120,19 @@ def run_massdns_on_targets(resolvers_file: str, targets_list: List[str], tmp_res
         for t in targets_list:
             tf.write(t + "\n")
 
-    # include -s <threads> to control concurrent sockets/threads
-    cmd = ["massdns", "-r", resolvers_file, "-t", "A", "-o", "S", "-w", tmp_results_path, "-s", str(threads), tmp_targets_path]
+    # Build massdns command
+    # -r <resolvers> --processes <n> --socket-count <n> -s <hashmap-size> -t A -o S -w <outfile> <targetsfile>
+    cmd = [
+        massdns_bin,
+        "-r", resolvers_file,
+        "--processes", str(processes),
+        "--socket-count", str(socket_count),
+        "-s", str(hashmap_size),
+        "-t", "A",
+        "-o", "S",
+        "-w", tmp_results_path,
+        tmp_targets_path
+    ]
     try:
         subprocess.run(cmd, check=True)
         try:
@@ -122,6 +142,13 @@ def run_massdns_on_targets(resolvers_file: str, targets_list: List[str], tmp_res
         return True
     except subprocess.CalledProcessError:
         print("[!] massdns failed on this batch.")
+        try:
+            os.remove(tmp_targets_path)
+        except OSError:
+            pass
+        return False
+    except FileNotFoundError:
+        print(f"[!] massdns binary not found at: {massdns_bin}")
         try:
             os.remove(tmp_targets_path)
         except OSError:
@@ -137,8 +164,11 @@ def parse_massdns_results_for_alive(results_path: str) -> List[str]:
             parts = line.split()
             # massdns simple output: <name> <type> <data> ...
             if len(parts) >= 3 and parts[1].upper() == "A":
-                alive.append(parts[0].rstrip("."))
-    return alive
+                # strip trailing dot if present
+                name = parts[0].rstrip(".")
+                alive.append(name)
+    # unique
+    return list(dict.fromkeys(alive))
 
 def append_alive(alive_list: List[str], seen_alive: set):
     if not alive_list:
@@ -159,7 +189,11 @@ def process_patterns_stream(
     batch_size: int = 1000,
     max_per_pattern: Optional[int] = None,
     skip_missing_main: bool = False,
-    threads: int = 6000,
+    massdns_bin: str = "massdns",
+    processes: int = 1,
+    socket_count: int = 1,
+    hashmap_size: int = 10000,
+    run_dns: bool = False,
 ):
     number_words = read_small_list(number_file)
     region_words = read_small_list(region_file)
@@ -200,10 +234,13 @@ def process_patterns_stream(
                 if batch:
                     batch_count += 1
                     tmp_results = os.path.join(OUTPUT_DIR, f"massdns_{os.getpid()}_{batch_count}.txt")
-                    ok = run_massdns_on_targets(resolvers_file, batch, tmp_results, threads)
-                    if ok:
-                        alive = parse_massdns_results_for_alive(tmp_results)
-                        append_alive(alive, seen_alive)
+                    if run_dns:
+                        ok = run_massdns_on_targets(massdns_bin, resolvers_file, batch, tmp_results, processes, socket_count, hashmap_size)
+                        if ok:
+                            alive = parse_massdns_results_for_alive(tmp_results)
+                            append_alive(alive, seen_alive)
+                    else:
+                        print(f"[i] (dry-run) would run massdns on {len(batch)} names -> {tmp_results}")
                     try:
                         os.remove(tmp_results)
                     except OSError:
@@ -214,10 +251,13 @@ def process_patterns_stream(
             if len(batch) >= batch_size:
                 batch_count += 1
                 tmp_results = os.path.join(OUTPUT_DIR, f"massdns_{os.getpid()}_{batch_count}.txt")
-                ok = run_massdns_on_targets(resolvers_file, batch, tmp_results, threads)
-                if ok:
-                    alive = parse_massdns_results_for_alive(tmp_results)
-                    append_alive(alive, seen_alive)
+                if run_dns:
+                    ok = run_massdns_on_targets(massdns_bin, resolvers_file, batch, tmp_results, processes, socket_count, hashmap_size)
+                    if ok:
+                        alive = parse_massdns_results_for_alive(tmp_results)
+                        append_alive(alive, seen_alive)
+                else:
+                    print(f"[i] (dry-run) would run massdns on {len(batch)} names -> {tmp_results}")
                 try:
                     os.remove(tmp_results)
                 except OSError:
@@ -228,10 +268,13 @@ def process_patterns_stream(
         if batch:
             batch_count += 1
             tmp_results = os.path.join(OUTPUT_DIR, f"massdns_{os.getpid()}_{batch_count}.txt")
-            ok = run_massdns_on_targets(resolvers_file, batch, tmp_results, threads)
-            if ok:
-                alive = parse_massdns_results_for_alive(tmp_results)
-                append_alive(alive, seen_alive)
+            if run_dns:
+                ok = run_massdns_on_targets(massdns_bin, resolvers_file, batch, tmp_results, processes, socket_count, hashmap_size)
+                if ok:
+                    alive = parse_massdns_results_for_alive(tmp_results)
+                    append_alive(alive, seen_alive)
+            else:
+                print(f"[i] (dry-run) would run massdns on {len(batch)} names -> {tmp_results}")
             try:
                 os.remove(tmp_results)
             except OSError:
@@ -249,7 +292,10 @@ def main():
     parser.add_argument("--max-per-pattern", type=int, default=0, help="Optional cap: max names to generate/test per pattern (0 = no cap)")
     parser.add_argument("--run-dns", action="store_true", help="Actually run massdns (for testing you can omit to only dry-run generation)")
     parser.add_argument("--skip-missing", action="store_true", help="If set, patterns that require the main wordlist will be skipped instead of aborting")
-    parser.add_argument("--threads", type=int, default=6000, help="Number of massdns sockets/threads (-s). Default: 6000")
+    parser.add_argument("--massdns-bin", default="massdns", help="Path to massdns binary (default: massdns on PATH)")
+    parser.add_argument("--processes", type=int, default=1, help="massdns --processes value (default: 1)")
+    parser.add_argument("--socket-count", type=int, default=1, help="massdns --socket-count value (default: 1)")
+    parser.add_argument("--hashmap-size", type=int, default=10000, help="massdns -s (hashmap-size) value (default: 10000)")
     args = parser.parse_args()
 
     if not os.path.exists(args.patterns):
@@ -283,16 +329,17 @@ def main():
     # Dry-run behavior: monkeypatch run_massdns_on_targets to avoid actual DNS queries
     if not args.run_dns:
         print("[i] Dry-run mode (no massdns). To actually resolve, add --run-dns")
-        original_run = globals()['run_massdns_on_targets']
-        globals()['run_massdns_on_targets'] = lambda *a, **k: True
         process_patterns_stream(
             args.patterns, main_wordlist, resolvers_file,
             args.number_file, args.region_file, batch_size=args.batch_size,
             max_per_pattern=(args.max_per_pattern or None),
             skip_missing_main=args.skip_missing,
-            threads=args.threads,
+            massdns_bin=args.massdns_bin,
+            processes=args.processes,
+            socket_count=args.socket_count,
+            hashmap_size=args.hashmap_size,
+            run_dns=False,
         )
-        globals()['run_massdns_on_targets'] = original_run
         print("[i] Dry-run complete.")
         return
 
@@ -302,7 +349,11 @@ def main():
         args.number_file, args.region_file, batch_size=args.batch_size,
         max_per_pattern=(args.max_per_pattern or None),
         skip_missing_main=args.skip_missing,
-        threads=args.threads,
+        massdns_bin=args.massdns_bin,
+        processes=args.processes,
+        socket_count=args.socket_count,
+        hashmap_size=args.hashmap_size,
+        run_dns=True,
     )
     print(f"[+] All done. Alive domains written to: {ALIVE_FILE}")
 
